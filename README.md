@@ -429,3 +429,8 @@ bodies. The shortest, most efficient path between Stellar and the rest of the
 blockchain universe._
 
 </div>
+
+## Handsoff notes
+
+<!-- handsoff-issue-684 -->
+- #684: soroban: `addr.to_string().to_string()` calls a method that does not exist on `soroban_sdk::String`
