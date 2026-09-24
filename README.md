@@ -429,3 +429,8 @@ bodies. The shortest, most efficient path between Stellar and the rest of the
 blockchain universe._
 
 </div>
+
+## Handsoff notes
+
+<!-- handsoff-issue-685 -->
+- #685: soroban: two warnings in `lib.rs` will fail the `clippy -D warnings` CI gate once the crate compiles
