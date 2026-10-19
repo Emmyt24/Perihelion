@@ -14,28 +14,43 @@ info:
     ## Intent lifecycle
 
     The full cross-chain intent lifecycle (as modeled by the SDK and the
-    on-chain contracts) has six states:
+    on-chain contracts) has seven states:
 
     ```
     pending → claimed → settling → settled
            ↘                    ↘
-            expired              refunded
+            expired              cancelling → refunded
     ```
 
-    | Status     | Meaning                                                      |
-    |------------|--------------------------------------------------------------|
-    | `pending`  | Signed, in the mempool, unclaimed by any solver              |
-    | `claimed`  | A solver has locked the source-chain funds                   |
-    | `settling` | Cross-chain LayerZero message is in flight                   |
-    | `settled`  | Assets released on Stellar; bridge complete                  |
-    | `refunded` | Solver-initiated refund after a failed or cancelled fill     |
-    | `expired`  | Deadline passed before any solver claimed the intent         |
+    | Status       | Meaning                                                    |
+    |--------------|------------------------------------------------------------|
+    | `pending`    | Signed, in the mempool, unclaimed by any solver            |
+    | `claimed`    | A solver has locked the source-chain funds                 |
+    | `settling`   | Cross-chain LayerZero message is in flight                 |
+    | `settled`    | Assets released on Stellar; bridge complete                |
+    | `cancelling` | A `CancelIntent` was delivered; no refund observed yet     |
+    | `refunded`   | A refund event was observed on the source chain            |
+    | `expired`    | Deadline passed before any solver claimed the intent       |
 
-    **This mempool's `IntentStatus` only covers four of those six states:**
-    `pending`, `settled`, `refunded`, `expired`. `claimed` and `settling` are
-    part of the broader on-chain/SDK lifecycle but are never assigned by this
-    reference implementation — solvers and the relayer currently track those
-    intermediate states out-of-band.
+    **This mempool's `IntentStatus` only covers five of those seven states:**
+    `pending`, `settled`, `cancelling`, `refunded`, `expired`. `claimed` and
+    `settling` are part of the broader on-chain/SDK lifecycle but are never
+    assigned by this reference implementation — solvers and the relayer
+    currently track those intermediate states out-of-band.
+
+    ## `cancelling` vs `refunded`
+
+    `cancelling` is a non-terminal status. It is reported once a
+    `CancelIntent` has been delivered to the Stellar settlement contract,
+    which marks the Stellar record cancelled but does not move any funds.
+    User refunds happen on the source (EVM) chain, either through
+    `cancelExpired` or through a `CancelIntent` travelling from Stellar to
+    EVM.
+
+    `refunded` is terminal and is only assigned after the relayer has
+    observed the source-chain `Refunded`/`RefundedLocalTimeout` event for
+    the intent hash. A record in `cancelling` is still refundable on-chain;
+    clients must not treat it as a completed refund.
 
     ## Status ownership
 
@@ -345,7 +360,7 @@ paths:
                 $ref: '#/components/schemas/IntentRecord'
         '400':
           description: |
-            Invalid hash, or a status that is not one of the four states this
+            Invalid hash, or a status that is not one of the five states this
             mempool assigns.
           content:
             application/json:
@@ -400,12 +415,19 @@ components:
     IntentStatus:
       type: string
       description: |
-        The four statuses this mempool assigns. `claimed` and `settling` are
+        The five statuses this mempool assigns. `claimed` and `settling` are
         part of the broader on-chain/SDK lifecycle but are never assigned by
         this reference implementation.
+
+        `cancelling` is non-terminal: a `CancelIntent` was delivered to
+        Stellar, but no refund has been observed on the source chain yet.
+        `refunded` is terminal and is only assigned after the relayer
+        observes a source-chain `Refunded`/`RefundedLocalTimeout` event for
+        the intent hash.
       enum:
         - pending
         - settled
+        - cancelling
         - refunded
         - expired
 

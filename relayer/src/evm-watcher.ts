@@ -161,6 +161,52 @@ const LOCKED_DATA_PARAMS = parseAbiParameters(
   "address asset, uint256 amount, string destination, string destAsset, uint128 minDestAmount, uint64 deadline",
 );
 
+/**
+ * Minimal ABI for the PerihelionEscrow refund events.
+ *
+ * event Refunded(bytes32 indexed intentHash, address indexed user, address asset, uint256 amount)
+ * event RefundedLocalTimeout(bytes32 indexed intentHash, address indexed user, address asset, uint256 amount)
+ *
+ * Both events carry the intent hash as the first indexed topic, which is all
+ * the relayer needs to correlate a real on-chain refund with a mempool record.
+ */
+const REFUND_EVENT_ABIS = [
+  {
+    type: "event",
+    name: "Refunded",
+    inputs: [
+      { name: "intentHash", type: "bytes32", indexed: true },
+      { name: "user",       type: "address", indexed: true },
+      { name: "asset",      type: "address", indexed: false },
+      { name: "amount",     type: "uint256", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "RefundedLocalTimeout",
+    inputs: [
+      { name: "intentHash", type: "bytes32", indexed: true },
+      { name: "user",       type: "address", indexed: true },
+      { name: "asset",      type: "address", indexed: false },
+      { name: "amount",     type: "uint256", indexed: false },
+    ],
+  },
+] as const;
+
+/** A refund observed on the EVM source chain for a given intent hash. */
+export interface EvmRefundObservation {
+  /** The intent hash whose escrowed funds were refunded. */
+  intentHash: Hex;
+  /** Which refund path the escrow took. */
+  kind: "Refunded" | "RefundedLocalTimeout";
+  /** Block number the refund event was emitted in. */
+  blockNumber: number;
+  /** Transaction hash that emitted the refund event. */
+  transactionHash: Hex;
+  /** Log index of the refund event within its block. */
+  logIndex: number;
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -177,6 +223,12 @@ export interface EVMSourceWatcherConfig {
   stellarEid: EndpointId;
   /** Maximum block range per getLogs call (default 2000). Adapts downward on range errors. */
   maxBlockRange?: number;
+  /**
+   * Invoked once per observed EVM refund event (`Refunded` or
+   * `RefundedLocalTimeout`). The relayer uses this to report `refunded` to the
+   * mempool only after a real refund exists on the source chain.
+   */
+  onRefund?: (observation: EvmRefundObservation) => void | Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +249,8 @@ export class EVMSourceWatcher implements SourceWatcher {
   private maxBlockRange: number;
   private readonly transactionFetchConcurrency = 10;
   private readonly transactionFetchTimeoutMs = 10_000;
+  /** Highest block scanned for refund events; `null` until the first scan. */
+  private lastRefundScanBlock: number | null = null;
 
   constructor(private readonly config: EVMSourceWatcherConfig) {
     this.client = createPublicClient({
@@ -283,7 +337,97 @@ export class EVMSourceWatcher implements SourceWatcher {
       blockHeaders.push(...headers.filter((header): header is NonNullable<typeof header> => header !== null));
     }
 
+    // Observe refund events on the source chain so the relayer can report
+    // `refunded` to the mempool only when a real refund exists.
+    await this.scanRefunds(fromBlock, head);
+
     return { messages, head, headHash, parentHash, blockHeaders: blockHeaders.length > 0 ? blockHeaders : undefined };
+  }
+
+  /**
+   * Scan the escrow for `Refunded` / `RefundedLocalTimeout` events and invoke
+   * the configured `onRefund` callback for each one.
+   *
+   * The scan window starts at the greater of `fromBlock` and the last scanned
+   * block, so repeated polls do not re-report the same refund. Callers that
+   * need a full backfill can construct the watcher with a low `fromBlock`.
+   */
+  private async scanRefunds(fromBlock: number, head: number): Promise<void> {
+    const onRefund = this.config.onRefund;
+    if (!onRefund) return;
+
+    const start = this.lastRefundScanBlock === null
+      ? fromBlock
+      : Math.max(fromBlock, this.lastRefundScanBlock + 1);
+    if (start > head) return;
+
+    let scanHead = start;
+    while (scanHead <= head) {
+      const toBlock = Math.min(scanHead + this.maxBlockRange - 1, head);
+      let logs: Log[] = [];
+
+      try {
+        logs = await this.client.getLogs({
+          address: this.config.escrowAddress as `0x${string}`,
+          events: REFUND_EVENT_ABIS,
+          fromBlock: BigInt(scanHead),
+          toBlock: BigInt(toBlock),
+        });
+      } catch (err) {
+        if (this._isProviderRangeError(err)) {
+          if (this.maxBlockRange <= 1) throw err;
+          this.maxBlockRange = Math.max(1, Math.floor(this.maxBlockRange / 2));
+          console.warn("EVMSourceWatcher: provider range error during refund scan, halving max block range", {
+            newMaxBlockRange: this.maxBlockRange,
+            err: String(err),
+          });
+          continue;
+        }
+        throw err;
+      }
+
+      for (const log of logs) {
+        const observation = this.decodeRefundLog(log);
+        if (observation === null) continue;
+        try {
+          await onRefund(observation);
+        } catch (err) {
+          console.warn("EVMSourceWatcher: onRefund callback failed", {
+            intentHash: observation.intentHash,
+            err: String(err),
+          });
+        }
+      }
+
+      scanHead = toBlock + 1;
+    }
+
+    this.lastRefundScanBlock = head;
+  }
+
+  /**
+   * Decode a `Refunded` / `RefundedLocalTimeout` log into an observation.
+   * Returns `null` if the log does not carry a usable intent hash.
+   */
+  decodeRefundLog(log: Log): EvmRefundObservation | null {
+    if (log.blockNumber === undefined || log.blockNumber === null) return null;
+    const topics = log.topics as Hex[];
+    if (!topics || topics.length < 2) return null;
+
+    const intentHash = topics[1] as Hex;
+    if (!/^0x[0-9a-fA-F]{64}$/.test(intentHash)) return null;
+
+    const eventName = (log as { eventName?: string }).eventName;
+    const kind: EvmRefundObservation["kind"] =
+      eventName === "RefundedLocalTimeout" ? "RefundedLocalTimeout" : "Refunded";
+
+    return {
+      intentHash,
+      kind,
+      blockNumber: Number(log.blockNumber),
+      transactionHash: (log.transactionHash ?? "0x") as Hex,
+      logIndex: Number(log.logIndex ?? 0),
+    };
   }
 
   private _isProviderRangeError(err: unknown): boolean {
