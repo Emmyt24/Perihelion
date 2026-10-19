@@ -347,6 +347,16 @@ export class SorobanDestinationDelivery implements DestinationDelivery {
     if (payloadLength !== expectedLength) {
       throw new FatalError(`Invalid canonical payload length: ${payloadLength}`);
     }
+    if (message.messageType === "FillInstruction") {
+      const deadline = message.deadline;
+      if (deadline === undefined || deadline === null) {
+        throw new FatalError("Missing deadline on FillInstruction message");
+      }
+      const deadlineValue = typeof deadline === "bigint" ? deadline : BigInt(deadline);
+      if (deadlineValue <= 0n) {
+        throw new FatalError(`Invalid deadline on FillInstruction message: ${String(deadline)}`);
+      }
+    }
     const contract = new Contract(this.settlementContractId);
     const senderBytes = await this.getPeer(srcEid);
     if (!senderBytes) {

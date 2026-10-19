@@ -17,40 +17,34 @@ info:
     on-chain contracts) has seven states:
 
     ```
-    pending → claimed → settling → settled
-           ↘                    ↘
-            expired              cancelling → refunded
+    pending → claimed → settling → filled → settled
+           ↘                             ↘
+            expired                       refunded
     ```
 
-    | Status       | Meaning                                                    |
-    |--------------|------------------------------------------------------------|
-    | `pending`    | Signed, in the mempool, unclaimed by any solver            |
-    | `claimed`    | A solver has locked the source-chain funds                 |
-    | `settling`   | Cross-chain LayerZero message is in flight                 |
-    | `settled`    | Assets released on Stellar; bridge complete                |
-    | `cancelling` | A `CancelIntent` was delivered; no refund observed yet     |
-    | `refunded`   | A refund event was observed on the source chain            |
-    | `expired`    | Deadline passed before any solver claimed the intent       |
+    | Status     | Meaning                                                      |
+    |------------|--------------------------------------------------------------|
+    | `pending`  | Signed, in the mempool, unclaimed by any solver              |
+    | `claimed`  | A solver has locked the source-chain funds                   |
+    | `settling` | Cross-chain LayerZero message is in flight                   |
+    | `filled`   | Delivered on Stellar; awaiting source-chain `Released`       |
+    | `settled`  | Source chain emitted `Released`; bridge complete             |
+    | `refunded` | Solver-initiated refund after a failed or cancelled fill     |
+    | `expired`  | Deadline passed before any solver claimed the intent         |
 
     **This mempool's `IntentStatus` only covers five of those seven states:**
-    `pending`, `settled`, `cancelling`, `refunded`, `expired`. `claimed` and
+    `pending`, `filled`, `settled`, `refunded`, `expired`. `claimed` and
     `settling` are part of the broader on-chain/SDK lifecycle but are never
     assigned by this reference implementation — solvers and the relayer
     currently track those intermediate states out-of-band.
 
-    ## `cancelling` vs `refunded`
-
-    `cancelling` is a non-terminal status. It is reported once a
-    `CancelIntent` has been delivered to the Stellar settlement contract,
-    which marks the Stellar record cancelled but does not move any funds.
-    User refunds happen on the source (EVM) chain, either through
-    `cancelExpired` or through a `CancelIntent` travelling from Stellar to
-    EVM.
-
-    `refunded` is terminal and is only assigned after the relayer has
-    observed the source-chain `Refunded`/`RefundedLocalTimeout` event for
-    the intent hash. A record in `cancelling` is still refundable on-chain;
-    clients must not treat it as a completed refund.
+    `filled` is an intermediate, non-terminal state: the solver has delivered
+    the assets on Stellar, but the source-chain escrow has not yet released
+    the funds. A record becomes `settled` only after the source chain has
+    emitted `Released` for the intent; `settled` is reported by the component
+    that observes that event, not by the solver at fill time. Clients must
+    treat `filled` as distinct from `settled` — in particular, a `filled`
+    intent whose release fails can still be refunded.
 
     ## Status ownership
 
@@ -419,13 +413,12 @@ components:
         part of the broader on-chain/SDK lifecycle but are never assigned by
         this reference implementation.
 
-        `cancelling` is non-terminal: a `CancelIntent` was delivered to
-        Stellar, but no refund has been observed on the source chain yet.
-        `refunded` is terminal and is only assigned after the relayer
-        observes a source-chain `Refunded`/`RefundedLocalTimeout` event for
-        the intent hash.
+        `filled` is intermediate: the solver has delivered on Stellar but the
+        source chain has not yet released. `settled` is terminal and is only
+        reported after the source chain emits `Released` for the intent.
       enum:
         - pending
+        - filled
         - settled
         - cancelling
         - refunded

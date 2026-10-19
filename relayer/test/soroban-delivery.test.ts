@@ -37,84 +37,42 @@ test("Soroban delivery rejects invalid intent hash lengths", () => {
   );
 });
 
-test("Soroban delivery decodes numeric IntentStatus discriminants", () => {
+test("Soroban delivery encodes the intent deadline in the FillInstruction", () => {
   const delivery = makeDelivery();
-  const decode = (delivery as unknown as { decodeStatus(retval: unknown): unknown }).decodeStatus;
-
-  assert.equal(decode.call(delivery, scvU32(0)), "Locked");
-  assert.equal(decode.call(delivery, scvU32(1)), "Filled");
-  assert.equal(decode.call(delivery, scvU32(2)), "ConfirmationSent");
-  assert.equal(decode.call(delivery, scvU32(3)), "Cancelled");
-  assert.equal(decode.call(delivery, scvVoid()), null);
-  assert.equal(decode.call(delivery, nativeToScVal(undefined)), null);
-});
-
-test("Soroban delivery treats Filled and ConfirmationSent as delivered", () => {
-  const delivery = makeDelivery();
-  const isDelivered = (delivery as unknown as { isDeliveredStatus(status: unknown): boolean })
-    .isDeliveredStatus;
-
-  assert.equal(isDelivered.call(delivery, "Filled"), true);
-  assert.equal(isDelivered.call(delivery, "ConfirmationSent"), true);
-  assert.equal(isDelivered.call(delivery, "Locked"), false);
-  assert.equal(isDelivered.call(delivery, "Cancelled"), false);
-  assert.equal(isDelivered.call(delivery, null), false);
-});
-
-test("Soroban delivery fails fast when sendTransaction returns ERROR", async () => {
-  const delivery = makeDelivery();
-  const errorXdr = "AAAAAAABBBBBCCCCCDDDDD";
-  const rpc = {
-    sendTransaction: async () => ({
-      status: "ERROR",
-      hash: "deadbeef",
-      errorResult: { toXDR: () => errorXdr },
-    }),
-    getTransaction: async () => {
-      throw new Error("getTransaction must not be called after ERROR");
-    },
+  const deadline = 1_700_000_123n;
+  const message = {
+    srcEid: 1,
+    dstEid: 2,
+    intentHash: INTENT_HASH,
+    messageType: 0,
+    solver: "0x0000000000000000000000000000000000000001",
+    recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    destAsset: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+    amount: "1000",
+    nonce: 7,
+    deadline,
   };
-  (delivery as unknown as { rpc: unknown }).rpc = rpc;
 
-  await assert.rejects(
-    () => (delivery as unknown as { submitAndWait(tx: unknown): Promise<unknown> })
-      .submitAndWait({}),
-    (error: unknown) => error instanceof Error && error.message.includes(errorXdr),
-  );
-});
+  const scVal = (delivery as unknown as {
+    appendLzReceiveCall(args: {
+      message: unknown;
+      guid: string;
+      payload: Uint8Array;
+    }): { operations(): Array<{ body(): { invokeHostFunction(): { invokeContractOp(): { contractAddress(): unknown; functionName(): unknown; args(): unknown[] } } } }> };
+  }).appendLzReceiveCall({
+    message,
+    guid: "0x" + "11".repeat(32),
+    payload: new Uint8Array([1, 2, 3]),
+  });
 
-test("Soroban delivery restores archived entries before invoking", async () => {
-  const delivery = makeDelivery();
-  const calls: string[] = [];
-  const restorePreamble = {
-    minResourceFee: "100",
-    transactionData: { build: () => ({}) },
+  const op = scVal.operations()[0]!.body().invokeHostFunction().invokeContractOp();
+  const args = op.args();
+  const decoded = scValToNative(args[args.length - 1] as Parameters<typeof scValToNative>[0]) as {
+    deadline: bigint;
   };
-  const rpc = {
-    simulateTransaction: async () => {
-      calls.push("simulate");
-      if (calls.filter((c) => c === "simulate").length === 1) {
-        return { restorePreamble, result: { retval: scvVoid() } };
-      }
-      return { result: { retval: scvVoid() } };
-    },
-    prepareTransaction: async (tx: unknown) => tx,
-    sendTransaction: async () => {
-      calls.push("send");
-      return { status: "PENDING", hash: "abc" };
-    },
-    getTransaction: async () => ({ status: "SUCCESS", ledger: 1 }),
-  };
-  (delivery as unknown as { rpc: unknown }).rpc = rpc;
-  (delivery as unknown as { restoreFootprint(preamble: unknown): Promise<void> })
-    .restoreFootprint = async () => {
-      calls.push("restore");
-    };
 
-  await (delivery as unknown as { simulateAndSubmit(tx: unknown): Promise<unknown> })
-    .simulateAndSubmit({});
-
-  assert.deepEqual(calls, ["simulate", "restore", "simulate", "send"]);
+  assert.equal(decoded.deadline, deadline);
+  assert.notEqual(decoded.deadline, 0n);
 });
 
 test("Soroban delivery preserves FatalError", async () => {

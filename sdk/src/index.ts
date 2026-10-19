@@ -39,8 +39,3 @@ export * from "./validate.js";
 export * from "./escrow-abi.js";
 export * from "./escrow-client.js";
 export * from "./deployments.js";
-
-// Settlement contract `IntentStatus` enum and its ScVal decoder, re-exported
-// explicitly so they are reachable as `@perihelion/sdk` regardless of how the
-// types barrel is resolved.
-export { IntentStatus, decodeIntentStatus } from "./types.js";
