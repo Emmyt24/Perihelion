@@ -2,8 +2,15 @@
 
 import express, { type Request, Response, NextFunction } from "express";
 import type { Server } from "node:http";
-import { hashIntent, verifyIntent, perihelionDomain, parseIntent, isExpired } from "@perihelion/sdk";
-import type { Hex, SignedIntent, Address } from "@perihelion/sdk";
+import {
+  hashIntent,
+  verifyIntent,
+  verifyIntentOnChain,
+  perihelionDomain,
+  parseIntent,
+  isExpired,
+} from "@perihelion/sdk";
+import type { Hex, SignedIntent, Address, IntentRpcProvider } from "@perihelion/sdk";
 import { IntentStore } from "./store.js";
 import type { MempoolIntentRecord, IntentStatus } from "./types.js";
 
@@ -66,6 +73,12 @@ export interface MempoolServerOptions {
   writeRateLimit?: number;
   /** Per-IP request budget within the window for read routes (GET). Default 600. */
   readRateLimit?: number;
+  /**
+   * Optional JSON-RPC provider used to verify signatures from contract wallets
+   * (ERC-1271). When omitted, contract-wallet intents are rejected because
+   * their signatures cannot be checked with ECDSA alone.
+   */
+  provider?: IntentRpcProvider;
 }
 
 const DEFAULT_LIST_LIMIT = 100;
@@ -88,6 +101,7 @@ export class MempoolServer {
   private readRateLimit: number;
   private sweepTimer?: ReturnType<typeof setInterval>;
   private statusToken?: string;
+  private provider?: IntentRpcProvider;
   private isReady = false;
   private submissionStats = { accepted: 0, rejected: 0 };
   private rateLimitRejections = 0;
@@ -107,6 +121,7 @@ export class MempoolServer {
     this.verifyingContract = opts.verifyingContract;
     this.domain = perihelionDomain(this.chainId, this.verifyingContract);
     this.statusToken = opts.statusToken;
+    this.provider = opts.provider;
     this.store = new IntentStore({
       maxSize: opts.maxStoreSize,
       expiryGraceMs: opts.expiryGraceMs,
@@ -272,7 +287,12 @@ export class MempoolServer {
     // (always truthy), so no signature would ever be rejected. A throw from
     // malformed input is treated as a failed verification, since Express 4 does
     // not forward rejected promises from async handlers.
-    const signatureValid = await verifyIntent(parsed, signature, this.domain).catch(() => false);
+    //
+    // Contract wallets (Safe, ERC-4337 accounts) cannot produce an ECDSA
+    // signature that recovers to their address, so their signatures are
+    // checked through ERC-1271 `isValidSignature` over RPC instead. Without a
+    // configured provider the check fails closed.
+    const signatureValid = await this.verifySignature(parsed, signature).catch(() => false);
     if (!signatureValid) {
       this.submissionStats.rejected++;
       res.status(400).json({ error: "Signature verification failed" });
@@ -289,6 +309,19 @@ export class MempoolServer {
     this.store.set(hash, record);
     this.submissionStats.accepted++;
     res.status(201).json({ hash });
+  }
+
+  /**
+   * Verify a submitted signature against the intent's user. EOA users keep the
+   * pure ECDSA path; contract users are verified on-chain via ERC-1271. The
+   * result is always awaited so a rejected verification is never mistaken for
+   * a truthy Promise (#888).
+   */
+  private async verifySignature(intent: SignedIntent["intent"], signature: Hex): Promise<boolean> {
+    if (!this.provider) {
+      return verifyIntent(intent, signature, this.domain);
+    }
+    return verifyIntentOnChain(intent, signature, this.domain, this.provider);
   }
 
   private handleGetIntent(req: Request, res: Response): void {
